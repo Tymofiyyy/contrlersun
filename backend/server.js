@@ -1,4 +1,5 @@
 // server.js - Повна версія з Energy Mode Management та Daily Data Reset
+// ОНОВЛЕНО: Додано підтримку діапазонів часу (range schedules)
 const express = require('express');
 const cors = require('cors');
 const { Pool } = require('pg');
@@ -79,7 +80,7 @@ cron.schedule('0 0 * * *', async () => {
       
       if (totalRecords > 0) {
         const deleteResult = await client.query(
-          'DELETE FROM energy_data WHERE created_at = CURRENT_DATE'
+          'DELETE FROM energy_data WHERE created_at < CURRENT_DATE'
         );
         
         const deletedCount = deleteResult.rowCount;
@@ -142,120 +143,46 @@ cron.schedule('0 0 * * *', async () => {
 });
 
 // ============ ENERGY SCHEDULES CRON JOB - КОЖНУ ХВИЛИНУ ============
+// ОНОВЛЕНО: Додано підтримку range розкладів
 cron.schedule('* * * * *', async () => {
   try {
     const now = new Date();
+    const currentHour = now.getHours();
+    const currentMinute = now.getMinutes();
+    const currentDayOfWeek = now.getDay();
     
-    const schedulesToExecute = await pool.query(
+    // ========== ОБРОБКА TIME РОЗКЛАДІВ (як раніше) ==========
+    const timeSchedulesToExecute = await pool.query(
       `SELECT s.*, d.device_id as device_device_id
        FROM energy_schedules s
        JOIN devices d ON d.device_id = s.device_id
        WHERE s.is_enabled = true 
+         AND s.schedule_type = 'time'
          AND s.next_execution IS NOT NULL
          AND s.next_execution <= $1`,
       [now]
     );
     
-    if (schedulesToExecute.rows.length === 0) {
-      return;
+    if (timeSchedulesToExecute.rows.length > 0) {
+      console.log(`\n⏰ Found ${timeSchedulesToExecute.rows.length} TIME schedule(s) to execute`);
     }
     
-    console.log(`\n⏰ Found ${schedulesToExecute.rows.length} schedule(s) to execute`);
-    
-    for (const schedule of schedulesToExecute.rows) {
-      try {
-        const client = await pool.connect();
-        
-        try {
-          await client.query('BEGIN');
-          
-          const deviceId = schedule.device_id;
-          const targetMode = schedule.target_mode;
-          
-          console.log(`📅 Executing schedule: ${schedule.name} (${deviceId} → ${targetMode})`);
-          
-          const currentModeResult = await client.query(
-            'SELECT current_mode FROM device_energy_modes WHERE device_id = $1',
-            [deviceId]
-          );
-          
-          const oldMode = currentModeResult.rows.length > 0 
-            ? currentModeResult.rows[0].current_mode 
-            : null;
-          
-          await client.query(
-            `INSERT INTO device_energy_modes (device_id, current_mode, changed_by, last_changed)
-             VALUES ($1, $2, 'schedule', CURRENT_TIMESTAMP)
-             ON CONFLICT (device_id) 
-             DO UPDATE SET 
-               current_mode = $2,
-               changed_by = 'schedule',
-               last_changed = CURRENT_TIMESTAMP,
-               updated_at = CURRENT_TIMESTAMP`,
-            [deviceId, targetMode]
-          );
-          
-          await client.query(
-            `INSERT INTO energy_mode_history (device_id, from_mode, to_mode, changed_by, schedule_id)
-             VALUES ($1, $2, $3, 'schedule', $4)`,
-            [deviceId, oldMode, targetMode, schedule.id]
-          );
-          
-          if (schedule.repeat_type === 'once') {
-            await client.query(
-              `UPDATE energy_schedules 
-               SET last_executed = CURRENT_TIMESTAMP,
-                   next_execution = NULL,
-                   is_enabled = false
-               WHERE id = $1`,
-              [schedule.id]
-            );
-            console.log(`  ✓ One-time schedule disabled`);
-          } else {
-            await client.query(
-              `UPDATE energy_schedules 
-               SET last_executed = CURRENT_TIMESTAMP,
-                   next_execution = calculate_next_execution(
-                     hour, minute, repeat_type, repeat_days, CURRENT_TIMESTAMP
-                   )
-               WHERE id = $1`,
-              [schedule.id]
-            );
-            console.log(`  ✓ Next execution scheduled`);
-          }
-          
-          await client.query('COMMIT');
-          
-          const commandTopic = `solar/${deviceId}/command`;
-          const commandPayload = JSON.stringify({
-            command: 'setEnergyMode',
-            mode: targetMode,
-            timestamp: Date.now(),
-            source: 'schedule',
-            scheduleName: schedule.name
-          });
-          
-          mqttClient.publish(commandTopic, commandPayload, { qos: 1 }, (error) => {
-            if (error) {
-              console.error(`  ❌ Failed to send MQTT command:`, error);
-            } else {
-              console.log(`  ✅ MQTT command sent: ${deviceId} → ${targetMode}`);
-            }
-          });
-          
-        } catch (error) {
-          await client.query('ROLLBACK');
-          throw error;
-        } finally {
-          client.release();
-        }
-        
-      } catch (error) {
-        console.error(`❌ Error executing schedule ${schedule.id}:`, error);
-      }
+    for (const schedule of timeSchedulesToExecute.rows) {
+      await executeTimeSchedule(schedule);
     }
     
-    console.log(`✅ Schedule execution completed\n`);
+    // ========== ОБРОБКА RANGE РОЗКЛАДІВ (НОВЕ) ==========
+    const rangeSchedules = await pool.query(
+      `SELECT s.*, d.device_id as device_device_id
+       FROM energy_schedules s
+       JOIN devices d ON d.device_id = s.device_id
+       WHERE s.is_enabled = true 
+         AND s.schedule_type = 'range'`
+    );
+    
+    for (const schedule of rangeSchedules.rows) {
+      await checkAndExecuteRangeSchedule(schedule, currentHour, currentMinute, currentDayOfWeek);
+    }
     
   } catch (error) {
     console.error('❌ Error in schedule cron job:', error);
@@ -265,7 +192,254 @@ cron.schedule('* * * * *', async () => {
   timezone: "Europe/Kiev"
 });
 
-console.log('⏰ Schedule checker started (every minute)');
+// ============ ФУНКЦІЯ ВИКОНАННЯ TIME РОЗКЛАДУ (як раніше) ============
+async function executeTimeSchedule(schedule) {
+  try {
+    const client = await pool.connect();
+    
+    try {
+      await client.query('BEGIN');
+      
+      const deviceId = schedule.device_id;
+      const targetMode = schedule.target_mode;
+      
+      console.log(`📅 Executing TIME schedule: ${schedule.name} (${deviceId} → ${targetMode})`);
+      
+      const currentModeResult = await client.query(
+        'SELECT current_mode FROM device_energy_modes WHERE device_id = $1',
+        [deviceId]
+      );
+      
+      const oldMode = currentModeResult.rows.length > 0 
+        ? currentModeResult.rows[0].current_mode 
+        : null;
+      
+      await client.query(
+        `INSERT INTO device_energy_modes (device_id, current_mode, changed_by, last_changed)
+         VALUES ($1, $2, 'schedule', CURRENT_TIMESTAMP)
+         ON CONFLICT (device_id) 
+         DO UPDATE SET 
+           current_mode = $2,
+           changed_by = 'schedule',
+           last_changed = CURRENT_TIMESTAMP,
+           updated_at = CURRENT_TIMESTAMP`,
+        [deviceId, targetMode]
+      );
+      
+      await client.query(
+        `INSERT INTO energy_mode_history (device_id, from_mode, to_mode, changed_by, schedule_id)
+         VALUES ($1, $2, $3, 'schedule', $4)`,
+        [deviceId, oldMode, targetMode, schedule.id]
+      );
+      
+      if (schedule.repeat_type === 'once') {
+        await client.query(
+          `UPDATE energy_schedules 
+           SET last_executed = CURRENT_TIMESTAMP,
+               next_execution = NULL,
+               is_enabled = false
+           WHERE id = $1`,
+          [schedule.id]
+        );
+        console.log(`  ✓ One-time schedule disabled`);
+      } else {
+        await client.query(
+          `UPDATE energy_schedules 
+           SET last_executed = CURRENT_TIMESTAMP,
+               next_execution = calculate_next_execution(
+                 hour, minute, repeat_type, repeat_days, CURRENT_TIMESTAMP
+               )
+           WHERE id = $1`,
+          [schedule.id]
+        );
+        console.log(`  ✓ Next execution scheduled`);
+      }
+      
+      await client.query('COMMIT');
+      
+      const commandTopic = `solar/${deviceId}/command`;
+      const commandPayload = JSON.stringify({
+        command: 'setEnergyMode',
+        mode: targetMode,
+        timestamp: Date.now(),
+        source: 'schedule',
+        scheduleName: schedule.name
+      });
+      
+      mqttClient.publish(commandTopic, commandPayload, { qos: 1 }, (error) => {
+        if (error) {
+          console.error(`  ❌ Failed to send MQTT command:`, error);
+        } else {
+          console.log(`  ✅ MQTT command sent: ${deviceId} → ${targetMode}`);
+        }
+      });
+      
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+    
+  } catch (error) {
+    console.error(`❌ Error executing TIME schedule ${schedule.id}:`, error);
+  }
+}
+
+// ============ ФУНКЦІЯ ПЕРЕВІРКИ ТА ВИКОНАННЯ RANGE РОЗКЛАДУ (НОВЕ) ============
+async function checkAndExecuteRangeSchedule(schedule, currentHour, currentMinute, currentDayOfWeek) {
+  try {
+    const {
+      id,
+      device_id: deviceId,
+      name,
+      target_mode: targetMode,
+      secondary_mode: secondaryMode,
+      start_hour: startHour,
+      start_minute: startMinute,
+      end_hour: endHour,
+      end_minute: endMinute,
+      repeat_type: repeatType,
+      repeat_days: repeatDays
+    } = schedule;
+    
+    // Перевіряємо чи сьогодні потрібно виконувати
+    if (!shouldRunToday(repeatType, repeatDays, currentDayOfWeek)) {
+      return;
+    }
+    
+    // Розраховуємо час в хвилинах для порівняння
+    const currentTimeMinutes = currentHour * 60 + currentMinute;
+    const startTimeMinutes = startHour * 60 + startMinute;
+    const endTimeMinutes = endHour * 60 + endMinute;
+    
+    // Визначаємо чи зараз ми в діапазоні
+    let isInRange;
+    if (endTimeMinutes <= startTimeMinutes) {
+      // Діапазон через північ (наприклад, 22:00 - 06:00)
+      isInRange = currentTimeMinutes >= startTimeMinutes || currentTimeMinutes < endTimeMinutes;
+    } else {
+      // Звичайний діапазон (наприклад, 08:00 - 20:00)
+      isInRange = currentTimeMinutes >= startTimeMinutes && currentTimeMinutes < endTimeMinutes;
+    }
+    
+    // Визначаємо який режим має бути зараз
+    const effectiveSecondaryMode = secondaryMode || (targetMode === 'solar' ? 'grid' : 'solar');
+    const expectedMode = isInRange ? targetMode : effectiveSecondaryMode;
+    
+    // Отримуємо поточний режим
+    const currentModeResult = await pool.query(
+      'SELECT current_mode FROM device_energy_modes WHERE device_id = $1',
+      [deviceId]
+    );
+    const currentMode = currentModeResult.rows.length > 0 
+      ? currentModeResult.rows[0].current_mode 
+      : null;
+    
+    // Перевіряємо чи зараз точка переходу (початок або кінець діапазону)
+    const isStartTransition = currentHour === startHour && currentMinute === startMinute;
+    const isEndTransition = currentHour === endHour && currentMinute === endMinute;
+    
+    // Перемикаємо тільки якщо:
+    // 1. Зараз точка переходу (початок або кінець діапазону)
+    // 2. Поточний режим відрізняється від очікуваного
+    if ((isStartTransition || isEndTransition) && currentMode !== expectedMode) {
+      console.log(`\n📅 RANGE schedule transition: ${name}`);
+      console.log(`   Device: ${deviceId}`);
+      console.log(`   Range: ${String(startHour).padStart(2, '0')}:${String(startMinute).padStart(2, '0')} - ${String(endHour).padStart(2, '0')}:${String(endMinute).padStart(2, '0')}`);
+      console.log(`   Transition: ${isStartTransition ? 'START' : 'END'} of range`);
+      console.log(`   Mode change: ${currentMode} → ${expectedMode}`);
+      
+      await executeRangeModeChange(deviceId, currentMode, expectedMode, schedule);
+    }
+    
+  } catch (error) {
+    console.error(`❌ Error checking RANGE schedule ${schedule.id}:`, error);
+  }
+}
+
+// ============ ФУНКЦІЯ ПЕРЕВІРКИ ЧИ СЬОГОДНІ ПОТРІБНО ВИКОНУВАТИ (НОВЕ) ============
+function shouldRunToday(repeatType, repeatDays, currentDayOfWeek) {
+  switch (repeatType) {
+    case 'once':
+    case 'daily':
+      return true;
+    case 'weekdays':
+      // Пн-Пт (1-5)
+      return currentDayOfWeek >= 1 && currentDayOfWeek <= 5;
+    case 'weekends':
+      // Сб-Нд (0, 6)
+      return currentDayOfWeek === 0 || currentDayOfWeek === 6;
+    case 'weekly':
+      // Перевіряємо чи поточний день є у списку
+      return repeatDays && repeatDays.includes(currentDayOfWeek);
+    default:
+      return true;
+  }
+}
+
+// ============ ФУНКЦІЯ ВИКОНАННЯ ЗМІНИ РЕЖИМУ ДЛЯ RANGE (НОВЕ) ============
+async function executeRangeModeChange(deviceId, oldMode, newMode, schedule) {
+  const client = await pool.connect();
+  
+  try {
+    await client.query('BEGIN');
+    
+    // Оновлюємо режим
+    await client.query(
+      `INSERT INTO device_energy_modes (device_id, current_mode, changed_by, last_changed)
+       VALUES ($1, $2, 'schedule_range', CURRENT_TIMESTAMP)
+       ON CONFLICT (device_id) 
+       DO UPDATE SET 
+         current_mode = $2,
+         changed_by = 'schedule_range',
+         last_changed = CURRENT_TIMESTAMP,
+         updated_at = CURRENT_TIMESTAMP`,
+      [deviceId, newMode]
+    );
+    
+    // Записуємо в історію
+    await client.query(
+      `INSERT INTO energy_mode_history (device_id, from_mode, to_mode, changed_by, schedule_id)
+       VALUES ($1, $2, $3, 'schedule_range', $4)`,
+      [deviceId, oldMode, newMode, schedule.id]
+    );
+    
+    // Оновлюємо last_executed
+    await client.query(
+      `UPDATE energy_schedules SET last_executed = CURRENT_TIMESTAMP WHERE id = $1`,
+      [schedule.id]
+    );
+    
+    await client.query('COMMIT');
+    
+    // Відправляємо MQTT команду
+    const commandTopic = `solar/${deviceId}/command`;
+    const commandPayload = JSON.stringify({
+      command: 'setEnergyMode',
+      mode: newMode,
+      timestamp: Date.now(),
+      source: 'schedule_range',
+      scheduleName: schedule.name
+    });
+    
+    mqttClient.publish(commandTopic, commandPayload, { qos: 1 }, (error) => {
+      if (error) {
+        console.error(`  ❌ Failed to send MQTT command:`, error);
+      } else {
+        console.log(`  ✅ MQTT command sent: ${deviceId} → ${newMode}`);
+      }
+    });
+    
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error(`❌ Error executing RANGE mode change:`, error);
+  } finally {
+    client.release();
+  }
+}
+
+console.log('⏰ Schedule checker started (every minute) - supports TIME and RANGE schedules');
 
 // MQTT обробники
 mqttClient.on('connect', () => {
@@ -495,7 +669,8 @@ app.get('/health', (req, res) => {
     codes: deviceConfirmationCodes.size,
     features: {
       dailyCleanup: 'enabled_00:00_Kiev',
-      energySchedules: 'enabled_every_minute'
+      energySchedules: 'enabled_every_minute',
+      rangeSchedules: 'enabled'
     }
   });
 });
@@ -503,11 +678,12 @@ app.get('/health', (req, res) => {
 app.get('/', (req, res) => {
   res.json({
     message: 'Solar Controller API with Energy Mode Management',
-    version: '2.2.0',
+    version: '2.3.0',
     features: {
       'energy_tracking': 'enabled',
       'daily_reset': '00:00 Kiev time',
       'energy_mode_switching': 'manual + automatic schedules',
+      'schedule_types': 'time + range',
       'esp32_interval': '15 seconds',
       'app_sync': '5 seconds'
     },
@@ -867,6 +1043,7 @@ app.get('/api/devices/:deviceId/energy-mode/history', authenticateToken, async (
 });
 
 // ============ ENERGY SCHEDULES MANAGEMENT ============
+// ОНОВЛЕНО: Додано підтримку range розкладів
 
 // Отримання всіх розкладів для пристрою
 app.get('/api/devices/:deviceId/schedules', authenticateToken, async (req, res) => {
@@ -886,10 +1063,13 @@ app.get('/api/devices/:deviceId/schedules', authenticateToken, async (req, res) 
       return res.status(403).json({ error: 'Access denied' });
     }
     
+    // ОНОВЛЕНО: Сортування враховує обидва типи розкладів
     const schedules = await pool.query(
       `SELECT * FROM energy_schedules 
        WHERE device_id = $1 AND user_id = $2
-       ORDER BY hour, minute`,
+       ORDER BY 
+         COALESCE(hour, start_hour),
+         COALESCE(minute, start_minute)`,
       [deviceId, req.user.id]
     );
     
@@ -906,6 +1086,7 @@ app.get('/api/devices/:deviceId/schedules', authenticateToken, async (req, res) 
 });
 
 // Створення нового розкладу
+// ОНОВЛЕНО: Підтримка time та range типів
 app.post('/api/devices/:deviceId/schedules', authenticateToken, async (req, res) => {
   const client = await pool.connect();
   
@@ -915,23 +1096,39 @@ app.post('/api/devices/:deviceId/schedules', authenticateToken, async (req, res)
     const { deviceId } = req.params;
     const { 
       name, 
-      targetMode, 
+      targetMode,
+      scheduleType = 'time',  // НОВЕ: 'time' або 'range'
+      // Для time
       hour, 
-      minute, 
+      minute,
+      // Для range (НОВЕ)
+      startHour,
+      startMinute,
+      endHour,
+      endMinute,
+      secondaryMode,  // НОВЕ
+      // Загальні
       repeatType = 'once', 
       repeatDays = null,
       isEnabled = true 
     } = req.body;
     
-    console.log(`\n📅 Creating schedule for ${deviceId}`);
+    console.log(`\n📅 Creating ${scheduleType.toUpperCase()} schedule for ${deviceId}`);
     console.log(`   Name: ${name}`);
     console.log(`   Mode: ${targetMode}`);
-    console.log(`   Time: ${hour}:${minute}`);
+    
+    if (scheduleType === 'time') {
+      console.log(`   Time: ${hour}:${minute}`);
+    } else {
+      console.log(`   Range: ${startHour}:${startMinute} - ${endHour}:${endMinute}`);
+      console.log(`   Secondary mode: ${secondaryMode || 'auto'}`);
+    }
     console.log(`   Repeat: ${repeatType}`);
     
-    if (!name || !targetMode || hour === undefined || minute === undefined) {
+    // Валідація загальних полів
+    if (!name || !targetMode) {
       await client.query('ROLLBACK');
-      return res.status(400).json({ error: 'Missing required fields' });
+      return res.status(400).json({ error: 'Missing required fields: name, targetMode' });
     }
     
     if (!['solar', 'grid'].includes(targetMode)) {
@@ -939,9 +1136,9 @@ app.post('/api/devices/:deviceId/schedules', authenticateToken, async (req, res)
       return res.status(400).json({ error: 'Invalid target mode' });
     }
     
-    if (hour < 0 || hour > 23 || minute < 0 || minute > 59) {
+    if (!['time', 'range'].includes(scheduleType)) {
       await client.query('ROLLBACK');
-      return res.status(400).json({ error: 'Invalid time' });
+      return res.status(400).json({ error: 'Invalid schedule type. Must be "time" or "range"' });
     }
     
     if (!['once', 'daily', 'weekly', 'weekdays', 'weekends'].includes(repeatType)) {
@@ -949,6 +1146,37 @@ app.post('/api/devices/:deviceId/schedules', authenticateToken, async (req, res)
       return res.status(400).json({ error: 'Invalid repeat type' });
     }
     
+    // Валідація для time
+    if (scheduleType === 'time') {
+      if (hour === undefined || minute === undefined) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ error: 'Missing hour/minute for time schedule' });
+      }
+      if (hour < 0 || hour > 23 || minute < 0 || minute > 59) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ error: 'Invalid time values' });
+      }
+    }
+    
+    // Валідація для range
+    if (scheduleType === 'range') {
+      if (startHour === undefined || startMinute === undefined || 
+          endHour === undefined || endMinute === undefined) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ error: 'Missing start/end time for range schedule' });
+      }
+      if (startHour < 0 || startHour > 23 || startMinute < 0 || startMinute > 59 ||
+          endHour < 0 || endHour > 23 || endMinute < 0 || endMinute > 59) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ error: 'Invalid time values' });
+      }
+      if (secondaryMode && !['solar', 'grid'].includes(secondaryMode)) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ error: 'Invalid secondary mode' });
+      }
+    }
+    
+    // Перевірка доступу
     const accessCheck = await client.query(
       `SELECT 1 FROM user_devices ud
        JOIN devices d ON d.id = ud.device_id
@@ -961,27 +1189,45 @@ app.post('/api/devices/:deviceId/schedules', authenticateToken, async (req, res)
       return res.status(403).json({ error: 'Access denied' });
     }
     
-    // Розраховуємо next_execution в Node.js
-    const nextExecution = isEnabled ? calculateNextExecution(
-      hour,
-      minute,
-      repeatType,
-      repeatDays
-    ) : null;
+    let schedule;
+    
+    if (scheduleType === 'time') {
+      // Створення TIME розкладу (як раніше)
+      const nextExecution = isEnabled ? calculateNextExecution(
+        hour,
+        minute,
+        repeatType,
+        repeatDays
+      ) : null;
 
-    // Створюємо розклад
-    const schedule = await client.query(
-      `INSERT INTO energy_schedules 
-        (device_id, user_id, name, target_mode, hour, minute, repeat_type, repeat_days, is_enabled, next_execution)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-      RETURNING *`,
-      [deviceId, req.user.id, name, targetMode, hour, minute, repeatType, repeatDays, isEnabled, nextExecution]
-    );
+      schedule = await client.query(
+        `INSERT INTO energy_schedules 
+          (device_id, user_id, name, target_mode, schedule_type, hour, minute, repeat_type, repeat_days, is_enabled, next_execution)
+        VALUES ($1, $2, $3, $4, 'time', $5, $6, $7, $8, $9, $10)
+        RETURNING *`,
+        [deviceId, req.user.id, name, targetMode, hour, minute, repeatType, repeatDays, isEnabled, nextExecution]
+      );
+    } else {
+      // Створення RANGE розкладу (НОВЕ)
+      const effectiveSecondaryMode = secondaryMode || (targetMode === 'solar' ? 'grid' : 'solar');
+      
+      schedule = await client.query(
+        `INSERT INTO energy_schedules 
+          (device_id, user_id, name, target_mode, schedule_type, start_hour, start_minute, end_hour, end_minute, secondary_mode, repeat_type, repeat_days, is_enabled)
+        VALUES ($1, $2, $3, $4, 'range', $5, $6, $7, $8, $9, $10, $11, $12)
+        RETURNING *`,
+        [deviceId, req.user.id, name, targetMode, startHour, startMinute, endHour, endMinute, effectiveSecondaryMode, repeatType, repeatDays, isEnabled]
+      );
+    }
     
     await client.query('COMMIT');
     
     console.log(`✅ Schedule created with ID: ${schedule.rows[0].id}`);
-    console.log(`   Next execution: ${schedule.rows[0].next_execution}\n`);
+    if (scheduleType === 'time') {
+      console.log(`   Next execution: ${schedule.rows[0].next_execution}\n`);
+    } else {
+      console.log(`   Range schedule - checks every minute\n`);
+    }
     
     res.json({
       success: true,
@@ -998,6 +1244,7 @@ app.post('/api/devices/:deviceId/schedules', authenticateToken, async (req, res)
 });
 
 // Оновлення розкладу
+// ОНОВЛЕНО: Підтримка зміни типу розкладу
 app.put('/api/devices/:deviceId/schedules/:scheduleId', authenticateToken, async (req, res) => {
   const client = await pool.connect();
 
@@ -1007,9 +1254,15 @@ app.put('/api/devices/:deviceId/schedules/:scheduleId', authenticateToken, async
     const { deviceId, scheduleId } = req.params;
     const { 
       name, 
-      targetMode, 
+      targetMode,
+      scheduleType,  // НОВЕ
       hour, 
-      minute, 
+      minute,
+      startHour,     // НОВЕ
+      startMinute,   // НОВЕ
+      endHour,       // НОВЕ
+      endMinute,     // НОВЕ
+      secondaryMode, // НОВЕ
       repeatType, 
       repeatDays,
       isEnabled 
@@ -1018,104 +1271,90 @@ app.put('/api/devices/:deviceId/schedules/:scheduleId', authenticateToken, async
     console.log(`\n📅 Updating schedule ${scheduleId} for device ${deviceId}`);
 
     // Перевіряємо, що розклад належить цьому користувачу і цьому девайсу
-    const ownerCheck = await client.query(
-      `SELECT 1 FROM energy_schedules 
+    const current = await client.query(
+      `SELECT * FROM energy_schedules 
        WHERE id = $1 AND device_id = $2 AND user_id = $3`,
       [scheduleId, deviceId, req.user.id]
     );
 
-    if (ownerCheck.rows.length === 0) {
+    if (current.rows.length === 0) {
       await client.query('ROLLBACK');
       return res.status(403).json({ error: 'Access denied or schedule not found' });
     }
 
-    // Оновлюємо тільки передані поля
-    const updates = [];
-    const values = [];
-    let paramIndex = 1;
+    const currentSchedule = current.rows[0];
+    
+    // Визначаємо фінальні значення
+    const finalScheduleType = scheduleType ?? currentSchedule.schedule_type;
+    const finalTargetMode = targetMode ?? currentSchedule.target_mode;
+    const finalRepeatType = repeatType ?? currentSchedule.repeat_type;
+    const finalRepeatDays = repeatDays ?? currentSchedule.repeat_days;
+    const finalIsEnabled = isEnabled ?? currentSchedule.is_enabled;
+    const finalName = name ?? currentSchedule.name;
 
-    if (name !== undefined) {
-      updates.push(`name = $${paramIndex++}`);
-      values.push(name);
-    }
-    if (targetMode !== undefined) {
-      updates.push(`target_mode = $${paramIndex++}`);
-      values.push(targetMode);
-    }
-    if (hour !== undefined) {
-      updates.push(`hour = $${paramIndex++}`);
-      values.push(hour);
-    }
-    if (minute !== undefined) {
-      updates.push(`minute = $${paramIndex++}`);
-      values.push(minute);
-    }
-    if (repeatType !== undefined) {
-      updates.push(`repeat_type = $${paramIndex++}`);
-      values.push(repeatType);
-    }
-    if (repeatDays !== undefined) {
-      updates.push(`repeat_days = $${paramIndex++}`);
-      values.push(repeatDays);
-    }
-    if (isEnabled !== undefined) {
-      updates.push(`is_enabled = $${paramIndex++}`);
-      values.push(isEnabled);
-    }
+    let schedule;
 
-    // Якщо змінювали час / тип повторення / дні / статус – перераховуємо next_execution
-    if (
-      hour !== undefined ||
-      minute !== undefined ||
-      repeatType !== undefined ||
-      repeatDays !== undefined ||
-      isEnabled !== undefined
-    ) {
-      // Отримуємо поточні значення розкладу
-      const current = await client.query(
-        `SELECT * FROM energy_schedules 
-         WHERE id = $1 AND device_id = $2 AND user_id = $3`,
-        [scheduleId, deviceId, req.user.id]
+    if (finalScheduleType === 'time') {
+      // Оновлення TIME розкладу
+      const finalHour = hour ?? currentSchedule.hour;
+      const finalMinute = minute ?? currentSchedule.minute;
+      
+      const nextExecution = finalIsEnabled
+        ? calculateNextExecution(finalHour, finalMinute, finalRepeatType, finalRepeatDays)
+        : null;
+
+      schedule = await client.query(
+        `UPDATE energy_schedules 
+         SET name = $1, 
+             target_mode = $2, 
+             schedule_type = 'time',
+             hour = $3, 
+             minute = $4,
+             start_hour = NULL,
+             start_minute = NULL,
+             end_hour = NULL,
+             end_minute = NULL,
+             secondary_mode = NULL,
+             repeat_type = $5, 
+             repeat_days = $6, 
+             is_enabled = $7, 
+             next_execution = $8,
+             updated_at = CURRENT_TIMESTAMP
+         WHERE id = $9
+         RETURNING *`,
+        [finalName, finalTargetMode, finalHour, finalMinute, finalRepeatType, finalRepeatDays, finalIsEnabled, nextExecution, scheduleId]
       );
+    } else {
+      // Оновлення RANGE розкладу
+      const finalStartHour = startHour ?? currentSchedule.start_hour;
+      const finalStartMinute = startMinute ?? currentSchedule.start_minute;
+      const finalEndHour = endHour ?? currentSchedule.end_hour;
+      const finalEndMinute = endMinute ?? currentSchedule.end_minute;
+      const finalSecondaryMode = secondaryMode ?? currentSchedule.secondary_mode ?? 
+        (finalTargetMode === 'solar' ? 'grid' : 'solar');
 
-      if (current.rows.length > 0) {
-        const currentSchedule = current.rows[0];
-
-        const finalHour       = hour       !== undefined ? hour       : currentSchedule.hour;
-        const finalMinute     = minute     !== undefined ? minute     : currentSchedule.minute;
-        const finalRepeatType = repeatType !== undefined ? repeatType : currentSchedule.repeat_type;
-        const finalRepeatDays = repeatDays !== undefined ? repeatDays : currentSchedule.repeat_days;
-        const finalIsEnabled  = isEnabled  !== undefined ? isEnabled  : currentSchedule.is_enabled;
-
-        const nextExecution = finalIsEnabled
-          ? calculateNextExecution(
-              finalHour,
-              finalMinute,
-              finalRepeatType,
-              finalRepeatDays
-            )
-          : null;
-
-        updates.push(`next_execution = $${paramIndex++}`);
-        values.push(nextExecution);
-      }
+      schedule = await client.query(
+        `UPDATE energy_schedules 
+         SET name = $1, 
+             target_mode = $2, 
+             schedule_type = 'range',
+             hour = NULL,
+             minute = NULL,
+             start_hour = $3,
+             start_minute = $4,
+             end_hour = $5,
+             end_minute = $6,
+             secondary_mode = $7,
+             repeat_type = $8, 
+             repeat_days = $9, 
+             is_enabled = $10, 
+             next_execution = NULL,
+             updated_at = CURRENT_TIMESTAMP
+         WHERE id = $11
+         RETURNING *`,
+        [finalName, finalTargetMode, finalStartHour, finalStartMinute, finalEndHour, finalEndMinute, finalSecondaryMode, finalRepeatType, finalRepeatDays, finalIsEnabled, scheduleId]
+      );
     }
-
-    if (updates.length === 0) {
-      await client.query('ROLLBACK');
-      return res.status(400).json({ error: 'No fields to update' });
-    }
-
-    // scheduleId для WHERE
-    values.push(scheduleId);
-
-    const schedule = await client.query(
-      `UPDATE energy_schedules 
-       SET ${updates.join(', ')}
-       WHERE id = $${paramIndex}
-       RETURNING *`,
-      values
-    );
 
     await client.query('COMMIT');
 
@@ -1757,6 +1996,8 @@ app.get('/api/debug/codes', authenticateToken, async (req, res) => {
       SELECT 
         COUNT(*) as total_schedules,
         COUNT(*) FILTER (WHERE is_enabled = true) as enabled_schedules,
+        COUNT(*) FILTER (WHERE schedule_type = 'time') as time_schedules,
+        COUNT(*) FILTER (WHERE schedule_type = 'range') as range_schedules,
         COUNT(DISTINCT device_id) as devices_with_schedules
       FROM energy_schedules
     `);
@@ -1777,7 +2018,8 @@ app.get('/api/debug/codes', authenticateToken, async (req, res) => {
         energySchedules: {
           enabled: true,
           checkInterval: 'Every minute',
-          timezone: 'Europe/Kiev'
+          timezone: 'Europe/Kiev',
+          types: ['time', 'range']
         }
       }
     });
@@ -1790,7 +2032,7 @@ app.get('/api/debug/codes', authenticateToken, async (req, res) => {
       scheduleStats: { error: error.message },
       features: {
         dailyCleanup: { enabled: true, time: '00:00', timezone: 'Europe/Kiev' },
-        energySchedules: { enabled: true, checkInterval: 'Every minute' }
+        energySchedules: { enabled: true, checkInterval: 'Every minute', types: ['time', 'range'] }
       }
     });
   }
@@ -1840,19 +2082,21 @@ async function initDatabase() {
         const scheduleStats = await pool.query(`
           SELECT 
             COUNT(*) as total_schedules,
-            COUNT(*) FILTER (WHERE is_enabled = true) as enabled_schedules
+            COUNT(*) FILTER (WHERE is_enabled = true) as enabled_schedules,
+            COUNT(*) FILTER (WHERE schedule_type = 'time') as time_schedules,
+            COUNT(*) FILTER (WHERE schedule_type = 'range') as range_schedules
           FROM energy_schedules
         `);
         console.log(`📅 Schedules: ${scheduleStats.rows[0].total_schedules} total (${scheduleStats.rows[0].enabled_schedules} enabled)`);
+        console.log(`   Time: ${scheduleStats.rows[0].time_schedules}, Range: ${scheduleStats.rows[0].range_schedules}`);
       } else {
-        console.log('⚠️  Energy schedules table not found. Please run: node migrate-energy-modes.js');
+        console.log('⚠️  Energy schedules table not found. Please run: node reset-database.js');
       }
     }
   } catch (error) {
     console.error('❌ Database connection error:', error.message);
     console.log('💡 Make sure PostgreSQL is running and database exists');
     console.log('   Run: node reset-database.js to create tables');
-    console.log('   Run: node migrate-energy-modes.js to add energy mode tables');
     process.exit(1);
   }
 }
@@ -1975,19 +2219,21 @@ const server = app.listen(PORT, async () => {
   console.log(`🔌 MQTT Broker: ${process.env.MQTT_HOST || 'localhost'}:${process.env.MQTT_PORT || 1883}`);
   console.log(`⏰ Daily cleanup: 00:00 Kiev time`);
   console.log(`⏰ Schedule checker: Every minute`);
+  console.log(`📅 Schedule types: TIME + RANGE`);
   console.log('================================================================');
   console.log('\n📝 Energy Mode API endpoints:');
   console.log(`   GET /api/devices/:deviceId/energy-mode - Get current mode`);
   console.log(`   POST /api/devices/:deviceId/energy-mode - Set mode (manual)`);
   console.log(`   GET /api/devices/:deviceId/energy-mode/history - Get history`);
   console.log(`   GET /api/devices/:deviceId/schedules - Get schedules`);
-  console.log(`   POST /api/devices/:deviceId/schedules - Create schedule`);
+  console.log(`   POST /api/devices/:deviceId/schedules - Create schedule (time/range)`);
   console.log(`   PUT /api/devices/:deviceId/schedules/:id - Update schedule`);
   console.log(`   DELETE /api/devices/:deviceId/schedules/:id - Delete schedule`);
   console.log('================================================================');
   console.log('\n🔄 System Flow:');
   console.log('   Manual: App → API → DB → MQTT → ESP32');
-  console.log('   Schedule: Cron → DB check → MQTT → ESP32');
+  console.log('   Time Schedule: Cron → next_execution check → MQTT → ESP32');
+  console.log('   Range Schedule: Cron → start/end time check → MQTT → ESP32');
   console.log('   Offline: Schedule runs on server, syncs when app opens');
   console.log('================================================================\n');
   
@@ -2071,4 +2317,4 @@ process.on('unhandledRejection', (reason, promise) => {
   console.error('❌ Unhandled Rejection at:', promise, 'reason:', reason);
 });
 
-console.log('✅ Server with Energy Mode Management initialization complete');
+console.log('✅ Server with Energy Mode Management + Range Schedules initialization complete');
